@@ -5,8 +5,8 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Net;
 using System.Web;
+using System.Threading;
 
-using Misuzilla.Net.Irc;
 using Misuzilla.Applications.TwitterIrcGateway;
 using Misuzilla.Applications.TwitterIrcGateway.AddIns;
 using Misuzilla.Applications.TwitterIrcGateway.AddIns.Console;
@@ -229,10 +229,27 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 			CurrentSession.AddInManager.SaveConfig(Configuration);
 		}
 
+		/// <summary>
+		/// メッセージを送信する
+		/// </summary>
+		/// <param name="message"></param>
+		private void SendMessage(String message)
+		{
+#if true
+			var console = CurrentSession.AddInManager.GetAddIn<ConsoleAddIn>();
+			console.NotifyMessage(GetType().Name, message);
+#else
+			CurrentSession.SendTwitterGatewayServerMessage(String.Format("{0}: {1}", GetType().Name, message));
+#endif
+		}
+
 		private void CurrentSession_PreProcessTimelineStatuses(object sender, TimelineStatusesEventArgs e)
 		{
 			if (e.IsFirstTime)
+			{
+				// 初回は何もしない
 				return;
+			}
 
 			foreach (var status in e.Statuses.Status)
 			{
@@ -249,28 +266,27 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 							members.Add(status.User.Id);
 
 							// 適当に非同期で投げまくる
-							Action<AutoListsMatchPatternConfiguration, Status> action = this.AddMember;
-							action.BeginInvoke(item, status, new AsyncCallback((r) => { (r.AsyncState as Action<AutoListsMatchPatternConfiguration, Status>).EndInvoke(r); }), action);
+							ThreadPool.QueueUserWorkItem((state) => 
+							{
+								int retry = 3;	// 3回までリトライ
+								while (retry-- != 0)
+								{
+									try
+									{
+										AddMember(item, status);
+										retry = 0;
+									}
+									catch (Exception ex)
+									{
+										SendMessage(ex.Message);
+										Thread.Sleep(3 * 1000);
+									}
+								}
+							});
 						}
 					}
 				}
 			}
-		}
-
-
-
-		/// <summary>
-		/// メッセージを送信する
-		/// </summary>
-		/// <param name="message"></param>
-		private void SendMessage(String message)
-		{
-#if true
-			var console = CurrentSession.AddInManager.GetAddIn<ConsoleAddIn>();
-			console.NotifyMessage(GetType().Name, message);
-#else
-			CurrentSession.SendTwitterGatewayServerMessage(String.Format("{0}: {1}", GetType().Name, message));
-#endif
 		}
 
 		/// <summary>
@@ -278,18 +294,11 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 		/// </summary>
 		internal void AddMember(AutoListsMatchPatternConfiguration item, Status status)
 		{
-			try
+			if (!IsExist(item, status))
 			{
-				if (!IsExist(item, status))
-				{
-					String url = String.Format("/{0}/{1}/members.xml?id={2}", CurrentSession.TwitterUser.ScreenName, item.Slug, status.User.Id);
-					String body = CurrentSession.TwitterService.POST(url, new byte[] { });
-					SendMessage(String.Format("リスト {0} に {1} を追加しました。", item.Slug, status.User.ScreenName));
-				}
-			}
-			catch (Exception ex)
-			{
-				SendMessage(ex.Message);
+				String url = String.Format("/{0}/{1}/members.xml?id={2}", CurrentSession.TwitterUser.ScreenName, item.Slug, status.User.Id);
+				String body = CurrentSession.TwitterService.POST(url, new byte[] { });
+				SendMessage(String.Format("リスト {0} に {1} を追加しました。", item.Slug, status.User.ScreenName));
 			}
 		}
 
@@ -316,16 +325,9 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 		/// </summary>
 		internal void CreateList(string name, string mode)
 		{
-			try
-			{
-				String url = String.Format("/{0}/lists.xml?name={1}&mode={2}", CurrentSession.TwitterUser.ScreenName, name, mode);
-				String body = CurrentSession.TwitterService.POST(url, new byte[] { });
-				SendMessage(String.Format("リスト {0} ({1}) を作成しました。", name, mode));
-			}
-			catch (Exception ex)
-			{
-				SendMessage(ex.Message);
-			}
+			String url = String.Format("/{0}/lists.xml?name={1}&mode={2}", CurrentSession.TwitterUser.ScreenName, name, mode);
+			String body = CurrentSession.TwitterService.POST(url, new byte[] { });
+			SendMessage(String.Format("リスト {0} ({1}) を作成しました。", name, mode));
 		}
 	}
 }
