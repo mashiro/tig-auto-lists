@@ -32,10 +32,22 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 
 		public override string ToString()
 		{
-			return (Enabled ? String.Empty : "[DISABLED]")
-				+ (String.IsNullOrEmpty(Slug) ? String.Empty : String.Format(" Slug={0}", Slug))
-				+ (String.IsNullOrEmpty(MatchPattern) ? String.Empty : String.Format(" MatchPattern={0}", MatchPattern))
-				;
+			return ToShortString();
+		}
+
+		public string ToShortString()
+		{
+			StringBuilder sb = new StringBuilder();
+			sb.AppendFormat("{0}: {1}", Slug, MatchPattern);
+			return sb.ToString();
+		}
+
+		public string ToLongString()
+		{
+			StringBuilder sb = new StringBuilder();
+			sb.AppendFormat("[{0}]", Enabled ? "*" : " ");
+			sb.AppendFormat(" {0}: {1}", Slug, MatchPattern);
+			return sb.ToString();
 		}
 	}
 
@@ -43,6 +55,7 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 	{
 		[Browsable(false)]
 		public List<AutoListsMatchPatternConfiguration> Items { get; set; }
+
 		public AutoListsConfiguration()
 		{
 			Items = new List<AutoListsMatchPatternConfiguration>();
@@ -90,7 +103,7 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 			for (Int32 i = 0; i < Items.Count; ++i)
 			{
 				var item = Items[i];
-				Console.NotifyMessage(String.Format("{0}: {1}", i, item));
+				Console.NotifyMessage(String.Format("{0}: {1}", i, item.ToLongString()));
 			}
 		}
 
@@ -209,19 +222,26 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 
 	public class AutoListsAddIn : AddInBase
 	{
-		public AutoListsConfiguration Configuration { get; internal set; }
-		public Dictionary<string, List<int>> ListsMembers { get; set; }
+		internal AutoListsConfiguration Configuration { get; set; }
+		private Dictionary<string, HashSet<Int64>> ListsMembers { get; set; }
+		private HashSet<Int64> IgnoreIds { get; set; }
 
 		public AutoListsAddIn()
 		{
-			ListsMembers = new Dictionary<string, List<int>>();
+			ListsMembers = new Dictionary<string, HashSet<Int64>>();
+			IgnoreIds = new HashSet<Int64>();
 		}
 
 		public override void Initialize()
 		{
 			Configuration = CurrentSession.AddInManager.GetConfig<AutoListsConfiguration>();
-			CurrentSession.PreProcessTimelineStatuses += new EventHandler<TimelineStatusesEventArgs>(CurrentSession_PreProcessTimelineStatuses);
-			CurrentSession.AddInsLoadCompleted += (sender, e) => CurrentSession.AddInManager.GetAddIn<ConsoleAddIn>().RegisterContext<AutoListsContext>();
+			CurrentSession.PreProcessTimelineStatuses += new EventHandler<TimelineStatusesEventArgs>(PreProcessTimelineStatuses);
+			CurrentSession.PostFilterProcessTimelineStatus += new EventHandler<TimelineStatusEventArgs>(PostFilterProcessTimelineStatus);
+			CurrentSession.AddInsLoadCompleted += (sender, e) =>
+			{
+				// 最初にリストのメンバー取得してもいいけどあほほどAPI使うのでやめよう
+				CurrentSession.AddInManager.GetAddIn<ConsoleAddIn>().RegisterContext<AutoListsContext>();
+			};
 		}
 
 		internal void SaveConfig()
@@ -243,48 +263,57 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 #endif
 		}
 
-		private void CurrentSession_PreProcessTimelineStatuses(object sender, TimelineStatusesEventArgs e)
+		private void PreProcessTimelineStatuses(object sender, TimelineStatusesEventArgs e)
 		{
 			if (e.IsFirstTime)
 			{
-				// 初回は何もしない
-				return;
-			}
-
-			foreach (var status in e.Statuses.Status)
-			{
-				foreach (var item in Configuration.Items)
+				// APIの初回分は無視IDに追加
+				foreach(var status in e.Statuses.Status)
 				{
-					if (!ListsMembers.ContainsKey(item.Slug))
-						ListsMembers.Add(item.Slug, new List<int>());
+					IgnoreIds.Add(status.Id);
+				}
+			}
+		}
 
-					if (item.IsMatch(status))
+		private void PreProcessTimelineStatus(object sender, TimelineStatusEventArgs e)
+		{
+			if (IgnoreIds.Contains(e.Status.Id))
+				return;
+
+			foreach (var item in Configuration.Items)
+			{
+				if (!ListsMembers.ContainsKey(item.Slug))
+					ListsMembers.Add(item.Slug, new HashSet<Int64>());
+
+				// マッチするか
+				if (item.IsMatch(e.Status))
+				{
+					HashSet<Int64> members = ListsMembers[item.Slug];
+					if (members.Contains(e.Status.User.Id))
+						continue; // すでにListsに含まれている
+					members.Add(e.Status.User.Id);
+
+					// 適当に非同期で投げまくる
+					ThreadPool.QueueUserWorkItem((state) =>
 					{
-						List<int> members = ListsMembers[item.Slug];
-						if (!members.Contains(status.User.Id))
+						int retry = 3;	// 3回までリトライ
+						while (retry-- != 0)
 						{
-							members.Add(status.User.Id);
-
-							// 適当に非同期で投げまくる
-							ThreadPool.QueueUserWorkItem((state) => 
+							try
 							{
-								int retry = 3;	// 3回までリトライ
-								while (retry-- != 0)
+								if (!IsExist(item, e.Status))
 								{
-									try
-									{
-										AddMember(item, status);
-										retry = 0;
-									}
-									catch (Exception ex)
-									{
-										SendMessage(ex.Message);
-										Thread.Sleep(3 * 1000);
-									}
+									AddMember(item, e.Status);
+									retry = 0;
 								}
-							});
+							}
+							catch (Exception ex)
+							{
+								SendMessage(ex.Message);
+								Thread.Sleep(3 * 1000);
+							}
 						}
-					}
+					});
 				}
 			}
 		}
@@ -294,12 +323,9 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 		/// </summary>
 		internal void AddMember(AutoListsMatchPatternConfiguration item, Status status)
 		{
-			if (!IsExist(item, status))
-			{
-				String url = String.Format("/{0}/{1}/members.xml?id={2}", CurrentSession.TwitterUser.ScreenName, item.Slug, status.User.Id);
-				String body = CurrentSession.TwitterService.POST(url, new byte[] { });
-				SendMessage(String.Format("リスト {0} に {1} を追加しました。", item.Slug, status.User.ScreenName));
-			}
+			String url = String.Format("/{0}/{1}/members.xml?id={2}", CurrentSession.TwitterUser.ScreenName, item.Slug, status.User.Id);
+			String body = CurrentSession.TwitterService.POST(url, new byte[] { });
+			SendMessage(String.Format("リスト {0} に {1} を追加しました。", item.Slug, status.User.ScreenName));
 		}
 
 		/// <summary>
@@ -313,10 +339,13 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 				String body = CurrentSession.TwitterService.GET(url, false);
 				return true;
 			}
-			catch (Exception)
+			catch (WebException ex)
 			{
-				// 404なら例外を投げるっぽい
-				return false;
+				// 取ってこれなかったらメンバに存在しない
+				if ((ex.Response as HttpWebResponse).StatusCode == HttpStatusCode.NotFound)
+					return false;
+
+				throw;
 			}
 		}
 
@@ -329,5 +358,7 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 			String body = CurrentSession.TwitterService.POST(url, new byte[] { });
 			SendMessage(String.Format("リスト {0} ({1}) を作成しました。", name, mode));
 		}
+
+		public EventHandler<TimelineStatusEventArgs> PostFilterProcessTimelineStatus { get; set; }
 	}
 }
