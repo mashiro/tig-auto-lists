@@ -226,6 +226,12 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 		private Dictionary<string, HashSet<Int64>> ListsMembers { get; set; }
 		private HashSet<Int64> IgnoreIds { get; set; }
 
+		private class ProcessMemberArgs
+		{
+			public AutoListsMatchPatternConfiguration Item { get; set; }
+			public Status Status { get; set; }
+		}
+
 		public AutoListsAddIn()
 		{
 			ListsMembers = new Dictionary<string, HashSet<Int64>>();
@@ -275,7 +281,7 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 			}
 		}
 
-		private void PreProcessTimelineStatus(object sender, TimelineStatusEventArgs e)
+		private void PostFilterProcessTimelineStatus(object sender, TimelineStatusEventArgs e)
 		{
 			if (IgnoreIds.Contains(e.Status.Id))
 				return;
@@ -294,26 +300,35 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 					members.Add(e.Status.User.Id);
 
 					// 適当に非同期で投げまくる
-					ThreadPool.QueueUserWorkItem((state) =>
-					{
-						int retry = 3;	// 3回までリトライ
-						while (retry-- != 0)
-						{
-							try
-							{
-								if (!IsExist(item, e.Status))
-								{
-									AddMember(item, e.Status);
-									retry = 0;
-								}
-							}
-							catch (Exception ex)
-							{
-								SendMessage(ex.Message);
-								Thread.Sleep(3 * 1000);
-							}
-						}
-					});
+					ThreadPool.QueueUserWorkItem(
+						new WaitCallback(ProcessMember),
+						new ProcessMemberArgs() { Item = item, Status = e.Status });
+				}
+			}
+		}
+
+		/// <summary>
+		/// リストに追加されるかもしれないメンバーを処理する
+		/// </summary>
+		private void ProcessMember(object state)
+		{
+			var args = state as ProcessMemberArgs;
+
+			int retry = 3;	// 3回までリトライ
+			while (retry-- != 0)
+			{
+				try
+				{
+					if (!IsExist(args.Item, args.Status))
+					{						
+						AddMember(args.Item, args.Status);
+						retry = 0;
+					}
+				}
+				catch (Exception ex)
+				{
+					SendMessage(ex.Message);
+					Thread.Sleep(3 * 1000);
 				}
 			}
 		}
@@ -358,7 +373,5 @@ namespace Spica.Applications.TwitterIrcGateway.AddIns.AutoLists
 			String body = CurrentSession.TwitterService.POST(url, new byte[] { });
 			SendMessage(String.Format("リスト {0} ({1}) を作成しました。", name, mode));
 		}
-
-		public EventHandler<TimelineStatusEventArgs> PostFilterProcessTimelineStatus { get; set; }
 	}
 }
